@@ -1,0 +1,1115 @@
+#!/usr/bin/env python3
+"""toxic — a friendly front-end for mutagen sync sessions.
+
+Single file, stdlib only. Run `toxic help` for usage.
+"""
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("TOXIC_CONFIG", "~/.config/toxic/config.json")
+)
+
+DEFAULTS = {
+    # applied to every `toxic add` unless overridden
+    "ignore": [
+        ".venv",
+        "uv.lock",
+        "*.pyc",
+        "__pycache__",
+        ".git",
+        ".mypy_*",
+        ".ruff*",
+        ".idea",
+    ],
+    "ignore_vcs": True,
+    "mode": None,  # mutagen's default (two-way-safe)
+    # optional: {"orange": "oranges.team", ...} shorthand -> host
+    "hosts": {},
+}
+
+
+# ---------------------------------------------------------------- pretty bits
+
+COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if COLOR else str(text)
+
+
+bold = lambda s: c(s, "1")
+dim = lambda s: c(s, "2")
+red = lambda s: c(s, "31")
+green = lambda s: c(s, "32")
+yellow = lambda s: c(s, "33")
+blue = lambda s: c(s, "34")
+cyan = lambda s: c(s, "36")
+
+
+def die(msg, code=1):
+    print(f"{red('error')}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"{dim('·')} {msg}")
+
+
+def human(size):
+    for unit in ("B", "K", "M", "G", "T"):
+        if size < 1024 or unit == "T":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024.0
+
+
+def dedupe(seq):
+    """Order-preserving de-duplication."""
+    seen, out = set(), []
+    for item in seq:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def visible_len(s):
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+def table(rows, headers):
+    if not rows:
+        return
+    widths = [visible_len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], visible_len(cell))
+
+    def line(cells, style=lambda s: s):
+        out = []
+        for i, cell in enumerate(cells):
+            pad = " " * (widths[i] - visible_len(cell))
+            out.append(style(cell) + pad)
+        print("  ".join(out).rstrip())
+
+    line(headers, lambda s: bold(dim(s.upper())))
+    for row in rows:
+        line(row)
+
+
+# ------------------------------------------------------------------- mutagen
+
+def mutagen_bin():
+    path = shutil.which("mutagen")
+    if not path:
+        die("mutagen not found in PATH — install it first (brew install mutagen-io/mutagen/mutagen)")
+    return path
+
+
+def run(args, capture=False, check=True):
+    cmd = [mutagen_bin()] + args
+    if capture:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if check and proc.returncode != 0:
+            die((proc.stderr or proc.stdout).strip() or f"mutagen {' '.join(args)} failed")
+        return proc
+    sys.stdout.flush()
+    return subprocess.run(cmd)
+
+
+def quiet(args, label):
+    """Run a mutagen command, showing our own line instead of its chatter."""
+    proc = run(args, capture=True, check=False)
+    if proc.returncode != 0:
+        print(f"{label}  {red((proc.stderr or proc.stdout).strip().splitlines()[-1])}")
+    else:
+        print(label)
+    return proc.returncode
+
+
+def sessions(selectors=None):
+    args = ["sync", "list", "--template", "{{json .}}"]
+    if selectors:
+        args += list(selectors)
+    proc = run(args, capture=True, check=False)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        if "did not match any sessions" in err or "unable to locate" in err:
+            return []
+        die(err or "unable to list sessions")
+    text = proc.stdout.strip()
+    if not text or text == "null":
+        return []
+    data = json.loads(text)
+    return data if isinstance(data, list) else [data]
+
+
+# ----------------------------------------------------------------- endpoints
+
+def parse_endpoint(spec):
+    """Return (kind, display, mutagen_url, path_tail) for a user-supplied endpoint."""
+    m = re.match(r"^(?:(?P<user>[^@/]+)@)?(?P<host>[A-Za-z0-9_.\-]+):(?P<path>.*)$", spec)
+    if m and not os.path.exists(spec):
+        host = config()["hosts"].get(m.group("host"), m.group("host"))
+        user = m.group("user")
+        return {
+            "kind": "remote",
+            "user": user,
+            "host": host,
+            "path": m.group("path") or "~",
+        }
+    return {"kind": "local", "path": os.path.abspath(os.path.expanduser(spec))}
+
+
+def endpoint_url(ep, extra=None):
+    path = ep["path"]
+    if extra:
+        path = path.rstrip("/") + "/" + extra
+    if ep["kind"] == "local":
+        return path
+    prefix = f"{ep['user']}@" if ep.get("user") else ""
+    return f"{prefix}{ep['host']}:{path}"
+
+
+def short_host(host):
+    """oranges.team -> oranges, 10.0.0.5 -> 10.0.0.5"""
+    if re.match(r"^[\d.]+$", host):
+        return host.replace(".", "-")
+    return host.split(".")[0]
+
+
+def fmt_endpoint(ep):
+    """Format an endpoint dict as it comes back from mutagen's JSON."""
+    path = ep.get("path", "?")
+    home = os.path.expanduser("~")
+    if ep.get("protocol") == "local":
+        if path.startswith(home):
+            path = "~" + path[len(home):]
+        return path
+    host = ep.get("host", "?")
+    return f"{cyan(host)}:{path}"
+
+
+# -------------------------------------------------------------------- config
+
+_config = None
+
+
+def config():
+    global _config
+    if _config is None:
+        cfg = dict(DEFAULTS)
+        try:
+            with open(CONFIG_PATH) as fh:
+                cfg.update(json.load(fh))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            die(f"bad config {CONFIG_PATH}: {exc}")
+        _config = cfg
+    return _config
+
+
+def global_ignores():
+    """Patterns ~/.mutagen.yml already applies to every session, so we don't repeat them.
+
+    Deliberately crude: mutagen's global file is sync defaults only, so a verbatim
+    quoted pattern in it is an ignore pattern.
+    """
+    try:
+        with open(os.path.expanduser("~/.mutagen.yml")) as fh:
+            text = fh.read()
+    except OSError:
+        return set()
+    return {m.group(1) for m in re.finditer(r'^\s*-\s*"?([^"\n]+?)"?\s*$', text, re.M)}
+
+
+# ------------------------------------------------------------------ commands
+
+def status_badge(s):
+    st = s.get("status", "unknown")
+    if s.get("paused"):
+        return yellow("paused")
+    if s.get("conflicts"):
+        return red(f"conflicts({len(s['conflicts'])})")
+    if st == "watching":
+        return green("watching")
+    if st in ("halted-on-root-emptied", "halted-on-root-deletion", "halted-on-root-type-change"):
+        return red(st)
+    if st.startswith("connecting") or st.startswith("disconnected"):
+        return red(st)
+    return blue(st)
+
+
+def problems(s):
+    out = []
+    for side in ("alpha", "beta"):
+        ep = s.get(side, {})
+        n = len(ep.get("scanProblems", [])) + len(ep.get("transitionProblems", []))
+        n += ep.get("excludedScanProblems", 0) + ep.get("excludedTransitionProblems", 0)
+        if n:
+            out.append(f"{side[0]}:{n}")
+        if not ep.get("connected", True) and not s.get("paused"):
+            out.append(f"{side[0]}:offline")
+    return ",".join(out)
+
+
+def cmd_list(argv):
+    long = any(a in ("-l", "--long") for a in argv)
+    as_json = "--json" in argv
+    selectors = [a for a in argv if not a.startswith("-")]
+    ss = sessions(selectors)
+    if as_json:
+        print(json.dumps(ss, indent=2))
+        return 0
+    if not ss:
+        info("no sync sessions")
+        return 0
+    rows = []
+    for s in ss:
+        row = [
+            bold(s.get("name") or s["identifier"][:12]),
+            status_badge(s),
+            fmt_endpoint(s.get("alpha", {})),
+            fmt_endpoint(s.get("beta", {})),
+        ]
+        if long:
+            a = s.get("alpha", {})
+            row += [
+                f"{a.get('files', 0)} files, {human(a.get('totalFileSize', 0))}",
+                s.get("mode", "two-way-safe"),
+                str(s.get("successfulCycles", 0)),
+            ]
+        row.append(red(problems(s)) if problems(s) else dim("-"))
+        rows.append(row)
+    headers = ["name", "status", "local", "remote"]
+    if long:
+        headers += ["size", "mode", "cycles"]
+    headers.append("issues")
+    table(rows, headers)
+    return 0
+
+
+def unique_name(base):
+    taken = {s.get("name") for s in sessions()}
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+def cmd_add(argv):
+    name = None
+    mode = config()["mode"]
+    ignores = list(config()["ignore"])
+    exact = False
+    paused = False
+    dry = False
+    no_ignore_vcs = not config()["ignore_vcs"]
+    positional = []
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-n", "--name"):
+            i += 1
+            name = argv[i]
+        elif a in ("-m", "--mode"):
+            i += 1
+            mode = argv[i]
+        elif a in ("-i", "--ignore"):
+            i += 1
+            ignores.append(argv[i])
+        elif a == "--no-ignore":
+            ignores = []
+        elif a == "--no-ignore-vcs":
+            no_ignore_vcs = True
+        elif a in ("-x", "--exact"):
+            exact = True
+        elif a in ("-p", "--paused"):
+            paused = True
+        elif a in ("-N", "--dry-run"):
+            dry = True
+        elif a.startswith("-"):
+            die(f"unknown option for add: {a}")
+        else:
+            positional.append(a)
+        i += 1
+
+    if len(positional) == 1 and ":" in positional[0]:
+        # `toxic add host:/path` — pull it into the current directory
+        positional.append(".")
+    if len(positional) != 2:
+        die("usage: toxic add <local> <host:/path> [--name N] [--ignore P] [--exact]")
+
+    src, dst = (parse_endpoint(p) for p in positional)
+    # allow reversed order: toxic add host:/path .
+    if src["kind"] == "remote" and dst["kind"] == "local":
+        src, dst = dst, src
+    if src["kind"] == "remote" and dst["kind"] == "remote":
+        die("at least one endpoint must be a local directory")
+
+    if not os.path.isdir(src["path"]):
+        die(f"{src['path']} is not a directory")
+
+    basename = os.path.basename(src["path"].rstrip("/"))
+    tail = None if (exact or dst["kind"] == "local") else basename
+    if dst["kind"] == "remote" and not exact:
+        # don't double-append if the remote path already ends with the basename
+        if dst["path"].rstrip("/").split("/")[-1] == basename:
+            tail = None
+
+    if not name:
+        suffix = short_host(dst["host"]) if dst["kind"] == "remote" else os.path.basename(
+            dst["path"].rstrip("/")
+        )
+        name = unique_name(f"{basename}-{suffix}")
+
+    ignores = [p for p in dedupe(ignores) if p not in global_ignores()]
+
+    args = ["sync", "create", endpoint_url(src), endpoint_url(dst, tail), "--name", name]
+    if mode:
+        args += ["--mode", mode]
+    for pat in ignores:
+        args += ["--ignore", pat]
+    args.append("--no-ignore-vcs" if no_ignore_vcs else "--ignore-vcs")
+    if paused:
+        args.append("--paused")
+
+    if dry:
+        print("mutagen " + " ".join(args))
+        return 0
+
+    print(
+        f"{green('+')} {bold(name)}  {fmt_endpoint({'protocol': 'local', 'path': src['path']})} "
+        f"{dim('→')} {endpoint_url(dst, tail)}"
+    )
+    return run(args).returncode
+
+
+def resolve(argv, what):
+    names = [a for a in argv if not a.startswith("-")]
+    if not names:
+        die(f"which session? usage: toxic {what} <name>...  (or --all)")
+    return names
+
+
+def simple(sub, argv, verb, all_ok=True):
+    if any(a in ("-a", "--all") for a in argv):
+        if not all_ok:
+            die(f"--all is not supported for {verb}")
+        ss = sessions()
+        if not ss:
+            info("no sync sessions")
+            return 0
+        targets = [s.get("name") or s["identifier"] for s in ss]
+    else:
+        targets = resolve(argv, verb)
+    rc = 0
+    for t in targets:
+        rc |= quiet(["sync", sub, t], f"{dim(verb)} {bold(t)}")
+    return rc
+
+
+def fzf_pick(lines, header, multi=True):
+    """Run fzf over `lines`. Returns picked lines, [] if nothing, None if fzf can't run."""
+    fzf = shutil.which("fzf")
+    if not fzf or not sys.stdin.isatty():
+        return None
+    args = [
+        fzf,
+        "--ansi",
+        "--reverse",
+        "--height=40%",
+        "--delimiter=\t",
+        "--with-nth=1,2,3",
+        f"--header={header}" + (" (tab to mark several)" if multi else ""),
+    ]
+    if multi:
+        args.append("--multi")
+    proc = subprocess.run(args, input="\n".join(lines), capture_output=True, text=True)
+    if proc.returncode != 0:  # 1 = no match, 130 = aborted
+        return []
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def pick(prompt, multi=True):
+    """Let the user choose sessions with fzf. Returns [] if nothing picked, None if no fzf."""
+    ss = sessions()
+    if not ss:
+        if shutil.which("fzf") and sys.stdin.isatty():
+            info("no sync sessions")
+            return []
+        return None
+    lines = []
+    for s in ss:
+        name = s.get("name") or s["identifier"]
+        lines.append(
+            f"{name}\t{s.get('status', '?')}\t{fmt_endpoint(s.get('alpha', {}))} -> "
+            f"{fmt_endpoint(s.get('beta', {}))}"
+        )
+    picked = fzf_pick(lines, prompt, multi)
+    if picked is None:
+        return None
+    return [ln.split("\t")[0] for ln in picked]
+
+
+def cmd_rm(argv):
+    yes = any(a in ("-y", "--yes") for a in argv)
+    argv = [a for a in argv if a not in ("-y", "--yes")]
+    picked = False
+    if any(a in ("-a", "--all") for a in argv):
+        targets = [s.get("name") or s["identifier"] for s in sessions()]
+        if not targets:
+            info("no sync sessions")
+            return 0
+    elif not [a for a in argv if not a.startswith("-")]:
+        targets = pick("terminate which sessions?")
+        if targets is None:
+            die("which session? usage: toxic rm <name>...  (or --all, or install fzf to pick)")
+        if not targets:
+            info("nothing selected")
+            return 0
+        picked = True
+    else:
+        targets = resolve(argv, "rm")
+    if not yes and not picked:
+        print(f"terminate: {', '.join(bold(t) for t in targets)}")
+        try:
+            if input("are you sure? [y/N] ").strip().lower() not in ("y", "yes"):
+                info("aborted")
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+    rc = 0
+    for t in targets:
+        rc |= quiet(["sync", "terminate", t], f"{red('-')} {bold(t)}")
+    return rc
+
+
+def cmd_status(argv):
+    names = [a for a in argv if not a.startswith("-")]
+    ss = sessions(names)
+    if not ss:
+        info("no matching sessions")
+        return 1
+    for s in ss:
+        print(f"{bold(s.get('name') or s['identifier'])}  {status_badge(s)}")
+        print(f"  {dim('id     ')} {s['identifier']}")
+        print(f"  {dim('local  ')} {fmt_endpoint(s.get('alpha', {}))}")
+        print(f"  {dim('remote ')} {fmt_endpoint(s.get('beta', {}))}")
+        print(f"  {dim('mode   ')} {s.get('mode', 'two-way-safe')}")
+        ign = s.get("ignore", {}).get("paths", [])
+        if ign:
+            print(f"  {dim('ignore ')} {' '.join(ign)}")
+        a = s.get("alpha", {})
+        print(
+            f"  {dim('content')} {a.get('directories', 0)} dirs, {a.get('files', 0)} files, "
+            f"{human(a.get('totalFileSize', 0))}  ({s.get('successfulCycles', 0)} cycles)"
+        )
+        for conflict in s.get("conflicts", []):
+            print(f"  {red('conflict')} {conflict.get('root')}")
+        for side in ("alpha", "beta"):
+            for kind in ("scanProblems", "transitionProblems"):
+                for p in s.get(side, {}).get(kind, []):
+                    print(f"  {yellow(side + ' ' + kind[:4])} {p.get('path')}: {p.get('error')}")
+        print()
+    return 0
+
+
+def cmd_monitor(argv):
+    names = [a for a in argv if not a.startswith("-")]
+    return run(["sync", "monitor"] + names).returncode
+
+
+def cmd_reset(argv):
+    """Flush, then force a full re-scan by pausing and resuming."""
+    targets = resolve(argv, "reset")
+    rc = 0
+    for t in targets:
+        rc |= quiet(["sync", "pause", t], f"{dim('reset')} {bold(t)}")
+        rc |= run(["sync", "resume", t], capture=True, check=False).returncode
+    return rc
+
+
+def cmd_daemon(argv):
+    sub = argv[0] if argv else "status"
+    if sub not in ("start", "stop", "restart", "status", "register", "unregister"):
+        die(f"unknown daemon command: {sub}")
+    if sub == "status":
+        proc = run(["daemon", "status"], capture=True, check=False)
+        print((proc.stdout or proc.stderr).strip())
+        return proc.returncode
+    if sub == "restart":
+        run(["daemon", "stop"], capture=True, check=False)
+        return run(["daemon", "start"]).returncode
+    return run(["daemon", sub]).returncode
+
+
+# ------------------------------------------------------------------ conflicts
+
+def change_kind(changes):
+    """Summarize one side of a conflict: created / modified / deleted."""
+    if not changes:
+        return "unchanged", None
+    ch = changes[0]
+    old, new = ch.get("old"), ch.get("new")
+    entry = new or old or {}
+    if old is None and new is not None:
+        verb = "created"
+    elif new is None:
+        verb = "deleted"
+    else:
+        verb = "modified"
+    return f"{verb} {entry.get('kind', 'file')}", (new or {}).get("digest")
+
+
+def conflict_rows(ss):
+    """Flatten every conflict of every session into (session, conflict) pairs."""
+    rows = []
+    for s in ss:
+        for conflict in s.get("conflicts", []):
+            rows.append((s, conflict))
+    return rows
+
+
+def ssh_target(ep):
+    user = ep.get("user")
+    return f"{user}@{ep['host']}" if user else ep["host"]
+
+
+def remote_quote(path):
+    """Quote a remote path, keeping a leading ~/ expandable by the remote shell."""
+    if path.startswith("~/"):
+        return "~/" + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def endpoint_child(ep, rel):
+    """Absolute path of `rel` inside an endpoint, with a paranoid containment check."""
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        die(f"refusing to touch suspicious conflict path: {rel!r}")
+    return ep["path"].rstrip("/") + "/" + rel
+
+
+def probe(ep, rel):
+    """Best-effort size/mtime for one side of a conflict. Never fatal."""
+    path = endpoint_child(ep, rel)
+    if ep.get("protocol") == "local":
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return dim("(missing)")
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+        return f"{human(st.st_size)}  {stamp}"
+    if ep.get("protocol") != "ssh":
+        return dim("(unknown)")
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", ssh_target(ep), f"ls -ldn -- {remote_quote(path)}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return dim("(unreachable)")
+    if proc.returncode != 0:
+        return dim("(missing)")
+    fields = proc.stdout.split()
+    if len(fields) >= 8:
+        return f"{human(int(fields[4]))}  {' '.join(fields[5:8])}" if fields[4].isdigit() else proc.stdout.strip()
+    return proc.stdout.strip()
+
+
+def delete_side(ep, rel, dry=False):
+    """Remove the losing copy so the surviving side propagates on the next cycle."""
+    path = endpoint_child(ep, rel)
+    proto = ep.get("protocol")
+    if proto == "local":
+        if dry:
+            return f"rm -rf {path}"
+        if not os.path.lexists(path):
+            return None
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as exc:
+            die(f"unable to remove {path}: {exc}")
+        return None
+    if proto != "ssh":
+        die(f"can't resolve automatically on a {proto} endpoint — remove {path} by hand")
+    cmd = f"rm -rf -- {remote_quote(path)}"
+    if dry:
+        return f"ssh {ssh_target(ep)} {cmd}"
+    proc = subprocess.run(["ssh", ssh_target(ep), cmd], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"ssh {ssh_target(ep)}: {(proc.stderr or proc.stdout).strip()}")
+    return None
+
+
+def ask(prompt, choices):
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "q"
+        if answer in choices:
+            return answer
+        if answer == "" and "" in choices:
+            return ""
+        print(dim(f"  pick one of: {'/'.join(k for k in choices if k)}"))
+
+
+def show_conflict(s, conflict, index, total):
+    root = conflict.get("root", "?")
+    alpha, beta = s.get("alpha", {}), s.get("beta", {})
+    a_what, a_digest = change_kind(conflict.get("alphaChanges"))
+    b_what, b_digest = change_kind(conflict.get("betaChanges"))
+    print()
+    print(f"{bold(f'conflict {index}/{total}')}  {dim('session')} {bold(s.get('name') or s['identifier'])}")
+    print(f"  {dim('path  ')} {yellow(root)}")
+    print(f"  {dim('local ')} {fmt_endpoint(alpha)}")
+    print(f"          {a_what}  {dim((a_digest or '')[:12])}  {probe(alpha, root)}")
+    print(f"  {dim('remote')} {fmt_endpoint(beta)}")
+    print(f"          {b_what}  {dim((b_digest or '')[:12])}  {probe(beta, root)}")
+
+
+def resolve_conflict(s, conflict, choice, dry=False):
+    """Apply `choice` ('l' keeps local, 'r' keeps remote) by deleting the other copy."""
+    root = conflict["root"]
+    loser = "beta" if choice == "l" else "alpha"
+    keeper = "alpha" if choice == "l" else "beta"
+    ep = s.get(loser, {})
+    label = "remote" if loser == "beta" else "local"
+    if dry:
+        print(f"  {dim('would run')} {delete_side(ep, root, dry=True)}")
+        return
+    print(f"  {red('rm')} {label} {endpoint_child(ep, root)}  {dim('→ ' + ('local' if keeper == 'alpha' else 'remote') + ' copy wins')}")
+    delete_side(ep, root)
+
+
+def cmd_resolve(argv):
+    dry = any(a in ("-N", "--dry-run") for a in argv)
+    forced = "l" if any(a == "--local" for a in argv) else "r" if any(a == "--remote" for a in argv) else None
+    names = [a for a in argv if not a.startswith("-")]
+
+    ss = [s for s in sessions(names) if s.get("conflicts")]
+    if not ss:
+        info("no conflicts" + (f" in {', '.join(names)}" if names else " anywhere — nothing to resolve"))
+        return 0
+
+    rows = conflict_rows(ss)
+    if not names and not forced:
+        lines = []
+        for s, conflict in rows:
+            a_what, _ = change_kind(conflict.get("alphaChanges"))
+            b_what, _ = change_kind(conflict.get("betaChanges"))
+            lines.append(
+                f"{bold(s.get('name') or s['identifier'])}\t{yellow(conflict.get('root', '?'))}"
+                f"\tlocal {a_what} {dim('vs')} remote {b_what}"
+            )
+        picked = fzf_pick(lines, "which conflicts to resolve?")
+        if picked is None:
+            info("fzf not available — resolving every conflict interactively")
+        elif not picked:
+            info("nothing selected")
+            return 0
+        else:
+            wanted = {tuple(re.sub(r"\033\[[0-9;]*m", "", ln).split("\t")[:2]) for ln in picked}
+            rows = [
+                (s, c) for s, c in rows
+                if ((s.get("name") or s["identifier"]), c.get("root", "?")) in wanted
+            ]
+
+    touched, total = set(), len(rows)
+    for i, (s, conflict) in enumerate(rows, 1):
+        show_conflict(s, conflict, i, total)
+        choice = forced
+        if not choice:
+            if not sys.stdin.isatty():
+                die("not a terminal — pass --local or --remote to resolve non-interactively")
+            choice = ask(
+                f"  keep {green('[l]ocal')} / {cyan('[r]emote')} / {dim('[s]kip')} / {dim('[q]uit')}? ",
+                ("l", "r", "s", "q"),
+            )
+        if choice == "q":
+            info("stopped")
+            break
+        if choice == "s":
+            print(f"  {dim('skipped')}")
+            continue
+        entry = (conflict.get("alphaChanges") or conflict.get("betaChanges") or [{}])[0]
+        is_dir = ((entry.get("new") or entry.get("old") or {}).get("kind") == "directory")
+        if is_dir and not forced and ask(f"  {red('that is a directory')} — delete it? [y/N] ", ("y", "n", "")) != "y":
+            print(f"  {dim('skipped')}")
+            continue
+        resolve_conflict(s, conflict, choice, dry=dry)
+        touched.add(s.get("name") or s["identifier"])
+
+    if touched and not dry:
+        for name in sorted(touched):
+            quiet(["sync", "flush", name], f"{dim('flush')} {bold(name)}")
+    return 0
+
+
+# -------------------------------------------------------------------- ignores
+
+def json_endpoint_url(ep):
+    """Rebuild the URL mutagen was given for an endpoint it reports in JSON."""
+    proto = ep.get("protocol")
+    if proto == "local":
+        return ep["path"]
+    if proto == "ssh":
+        prefix = f"{ep['user']}@" if ep.get("user") else ""
+        return f"{prefix}{ep['host']}:{ep['path']}"
+    die(f"can't rebuild a {proto} endpoint automatically — recreate the session by hand")
+
+
+def endpoint_flags(ep, side, unknown):
+    """Per-endpoint overrides (alpha/beta), which are usually empty."""
+    args = []
+    watch = ep.get("watch") or {}
+    if watch.get("mode"):
+        args += [f"--watch-mode-{side}", watch["mode"]]
+    if watch.get("pollingInterval"):
+        args += [f"--watch-polling-interval-{side}", str(watch["pollingInterval"])]
+    perms = ep.get("permissions") or {}
+    if perms.get("mode"):
+        args += [f"--permissions-mode-{side}", perms["mode"]]
+    comp = ep.get("compression") or {}
+    if comp.get("algorithm"):
+        args += [f"--compression-{side}", comp["algorithm"]]
+    for group, known in (("watch", ("mode", "pollingInterval")), ("permissions", ("mode",)),
+                         ("compression", ("algorithm",)), ("symlink", ()), ("ignore", ())):
+        for key in (ep.get(group) or {}):
+            if key not in known:
+                unknown.append(f"{side}.{group}.{key}")
+    return args
+
+
+def session_flags(s, ignores):
+    """Reconstruct `mutagen sync create` flags for an existing session."""
+    args, unknown = [], []
+    if s.get("mode"):
+        args += ["--mode", s["mode"]]
+
+    for key, flag in (("probeMode", "--probe-mode"), ("scanMode", "--scan-mode"),
+                      ("stageMode", "--stage-mode")):
+        if s.get(key):
+            args += [flag, s[key]]
+
+    ign = s.get("ignore") or {}
+    for pattern in dedupe(ignores):
+        args += ["--ignore", pattern]
+    args.append("--ignore-vcs" if ign.get("vcs") else "--no-ignore-vcs")
+    if ign.get("syntax"):
+        args += ["--ignore-syntax", ign["syntax"]]
+    unknown += [f"ignore.{k}" for k in ign if k not in ("paths", "vcs", "syntax")]
+
+    sym = s.get("symlink") or {}
+    if sym.get("mode"):
+        args += ["--symlink-mode", sym["mode"]]
+    unknown += [f"symlink.{k}" for k in sym if k != "mode"]
+
+    watch = s.get("watch") or {}
+    if watch.get("mode"):
+        args += ["--watch-mode", watch["mode"]]
+    if watch.get("pollingInterval"):
+        args += ["--watch-polling-interval", str(watch["pollingInterval"])]
+    unknown += [f"watch.{k}" for k in watch if k not in ("mode", "pollingInterval")]
+
+    perms = s.get("permissions") or {}
+    if perms.get("mode"):
+        args += ["--permissions-mode", perms["mode"]]
+    perm_flags = {
+        "defaultFileMode": "--default-file-mode",
+        "defaultDirectoryMode": "--default-directory-mode",
+        "defaultOwner": "--default-owner",
+        "defaultGroup": "--default-group",
+    }
+    for key, flag in perm_flags.items():
+        value = perms.get(key)
+        if value is not None:
+            args += [flag, f"{value:04o}" if isinstance(value, int) else str(value)]
+    unknown += [f"permissions.{k}" for k in perms if k not in perm_flags and k != "mode"]
+
+    comp = s.get("compression") or {}
+    if comp.get("algorithm"):
+        args += ["--compression", comp["algorithm"]]
+    unknown += [f"compression.{k}" for k in comp if k != "algorithm"]
+
+    hashing = s.get("hash") or {}
+    if isinstance(hashing, dict) and hashing.get("algorithm"):
+        args += ["--hash", hashing["algorithm"]]
+    elif isinstance(hashing, str):
+        args += ["--hash", hashing]
+
+    if s.get("maxEntryCount"):
+        args += ["--max-entry-count", str(s["maxEntryCount"])]
+    if s.get("maxStagingFileSize"):
+        args += ["--max-staging-file-size", str(s["maxStagingFileSize"])]
+
+    for key, value in (s.get("labels") or {}).items():
+        args += ["--label", f"{key}={value}"]
+    if s.get("paused"):
+        args.append("--paused")
+
+    args += endpoint_flags(s.get("alpha", {}), "alpha", unknown)
+    args += endpoint_flags(s.get("beta", {}), "beta", unknown)
+    return args, unknown
+
+
+def recreate(s, ignores, yes=False, dry=False):
+    """Terminate and recreate a session with a new ignore list (mutagen can't edit one)."""
+    name = s.get("name") or s["identifier"]
+    flags, unknown = session_flags(s, ignores)
+    cmd = ["sync", "create", json_endpoint_url(s["alpha"]), json_endpoint_url(s["beta"]),
+           "--name", name, "--no-global-configuration"] + flags
+    printable = "mutagen " + " ".join(shlex.quote(a) for a in cmd)
+
+    if dry:
+        print(printable)
+        return 0
+    if unknown:
+        print(f"{yellow('warning')}: these settings can't be carried over: {', '.join(sorted(set(unknown)))}")
+    if not yes:
+        print(dim(f"  {printable}"))
+        print(
+            f"mutagen can't edit a live session, so {bold(name)} will be terminated and recreated "
+            f"{dim('(history resets; one full re-scan follows, no files are touched)')}"
+        )
+        try:
+            if input("proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+                info("aborted")
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+
+    rc = quiet(["sync", "terminate", name], f"{dim('recreating')} {bold(name)}")
+    if rc != 0:
+        return rc
+    proc = run(cmd, capture=True, check=False)
+    if proc.returncode != 0:
+        print(f"{red('create failed')}: {(proc.stderr or proc.stdout).strip()}", file=sys.stderr)
+        print(f"{red('!')} {bold(name)} is gone — recreate it with:\n  {printable}", file=sys.stderr)
+        return proc.returncode
+    print(f"{green('✓')} {bold(name)}  {len(dedupe(ignores))} ignore patterns")
+    return 0
+
+
+def session_for_path(path):
+    """Sessions whose local root contains `path` (most specific root wins)."""
+    matches = []
+    target = os.path.realpath(path)
+    for s in sessions():
+        alpha = s.get("alpha", {})
+        if alpha.get("protocol") != "local":
+            continue
+        root = os.path.realpath(alpha["path"])
+        if target == root or target.startswith(root + os.sep):
+            matches.append((len(root), s))
+    if not matches:
+        return []
+    best = max(m[0] for m in matches)
+    return [s for length, s in matches if length == best]
+
+
+def ignore_pattern(arg, root):
+    """A real path under the session root becomes an anchored pattern; anything else is a glob."""
+    path = os.path.abspath(os.path.expanduser(arg))
+    if os.path.exists(path) and (path == root or path.startswith(root + os.sep)):
+        rel = os.path.relpath(path, root)
+        if rel == ".":
+            die("that's the session root itself")
+        return "/" + rel + ("/" if os.path.isdir(path) else "")
+    return arg
+
+
+def cmd_ignore(argv, remove=False):
+    name = None
+    yes = dry = False
+    patterns = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-n", "--name"):
+            i += 1
+            name = argv[i]
+        elif a in ("-y", "--yes"):
+            yes = True
+        elif a in ("-N", "--dry-run"):
+            dry = True
+        elif a in ("-d", "--rm", "--remove"):
+            remove = True
+        elif a.startswith("-") and a != "-":
+            die(f"unknown option for ignore: {a}")
+        else:
+            patterns.append(a)
+        i += 1
+
+    if name:
+        found = [s for s in sessions([name])]
+        if not found:
+            die(f"no session named {name}")
+        s = found[0]
+    else:
+        found = session_for_path(patterns[0] if patterns else ".") or session_for_path(".")
+        if len(found) == 1:
+            s = found[0]
+        elif found:
+            names = [x.get("name") or x["identifier"] for x in found]
+            lines = [
+                f"{n}\t{x.get('status', '?')}\t{fmt_endpoint(x.get('alpha', {}))} -> "
+                f"{fmt_endpoint(x.get('beta', {}))}"
+                for n, x in zip(names, found)
+            ]
+            picked = fzf_pick(lines, "which session?", multi=False)
+            if picked is None:
+                die(f"several sessions cover that path ({', '.join(names)}) — pick one with --name")
+            if not picked:
+                info("nothing selected")
+                return 0
+            s = found[names.index(picked[0].split("\t")[0])]
+        else:
+            die("can't tell which session — run this inside a synced folder or pass --name")
+
+    root = os.path.realpath(s["alpha"]["path"])
+    current = list((s.get("ignore") or {}).get("paths", []))
+
+    if not patterns:
+        print(f"{bold(s.get('name') or s['identifier'])}  {dim(fmt_endpoint(s['alpha']))}")
+        for pattern in dedupe(current):
+            print(f"  {pattern}")
+        if (s.get("ignore") or {}).get("vcs"):
+            print(f"  {dim('+ VCS directories (--ignore-vcs)')}")
+        return 0
+
+    wanted = [ignore_pattern(p, root) for p in patterns]
+    updated = list(current)
+    if remove:
+        missing = [p for p in wanted if p not in updated]
+        if missing:
+            die(f"not in the ignore list of {s.get('name')}: {', '.join(missing)}")
+        updated = [p for p in updated if p not in wanted]
+        verb, arrow = "un-ignoring", red("-")
+    else:
+        fresh = [p for p in wanted if p not in updated]
+        if not fresh:
+            info(f"already ignored in {bold(s.get('name'))}: {', '.join(wanted)}")
+            return 0
+        updated += fresh
+        wanted, verb, arrow = fresh, "ignoring", green("+")
+
+    print(f"{arrow} {verb} in {bold(s.get('name') or s['identifier'])}: {', '.join(yellow(p) for p in wanted)}")
+    return recreate(s, updated, yes=yes, dry=dry)
+
+
+def cmd_unignore(argv):
+    return cmd_ignore(argv, remove=True)
+
+
+HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the ceremony
+
+{bold('usage')}: toxic <command> [args]
+
+  {bold('list')} [-l] [--json] [name...]   list sessions and their state (alias: ls, l, or no command)
+  {bold('add')} <local> <host:/path>       create a sync session
+      -n, --name NAME     override the generated name ({dim('<folder>-<host>')})
+      -i, --ignore GLOB   extra ignore pattern (repeatable)
+      --no-ignore         drop the default ignore list
+      --no-ignore-vcs     propagate VCS directories
+      -m, --mode MODE     two-way-safe | two-way-resolved | one-way-safe | one-way-replica
+      -x, --exact         use the remote path as-is (don't append the folder name)
+      -p, --paused        create pre-paused
+      -N, --dry-run       print the mutagen command instead of running it
+  {bold('rm')} [name...] | -a           terminate sessions (alias: remove, terminate); -y skips
+                              the prompt, no arguments picks them with fzf
+  {bold('pause')} <name>... | -a         pause sessions
+  {bold('resume')} <name>... | -a        resume sessions
+  {bold('flush')} <name>... | -a         force a synchronization cycle
+  {bold('ignore')} [path|glob...]        add ignore patterns (paths inside a synced folder become
+                              anchored, e.g. {dim('build/ → /build/')}); no arguments lists them
+      -n, --name NAME     target session (default: the one containing the path or cwd)
+      -d, --rm            drop patterns instead (alias: toxic unignore)
+      -y, --yes / -N, --dry-run
+  {bold('resolve')} [name...]            walk through conflicts and pick a winner per file
+      --local / --remote  resolve everything that way, no questions asked
+      -N, --dry-run       print what would be removed instead of removing it
+  {bold('reset')} <name>...              pause + resume to force a full re-scan
+  {bold('status')} [name...]             detailed state, conflicts and problems (alias: st)
+  {bold('monitor')} [name]               live status stream from mutagen
+  {bold('daemon')} start|stop|restart|status
+  {bold('help')} | {bold('version')}
+
+{bold('examples')}:
+  toxic add . oranges.team:/tmp          {dim('→ ~/GitHub/bobuk/toxic ⇄ oranges.team:/tmp/toxic, named toxic-oranges')}
+  toxic add . bobuk.io:/srv -n web       {dim('→ named web')}
+  toxic add oranges.team:/stacks/olly .  {dim('→ reversed order works too')}
+  toxic ls -l                            {dim('→ sizes, modes, cycle counts')}
+
+{bold('config')}: {CONFIG_PATH} (optional JSON: ignore, ignore_vcs, mode, hosts)
+"""
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "ls": cmd_list,
+    "l": cmd_list,
+    "add": cmd_add,
+    "new": cmd_add,
+    "create": cmd_add,
+    "rm": cmd_rm,
+    "remove": cmd_rm,
+    "terminate": cmd_rm,
+    "delete": cmd_rm,
+    "pause": lambda a: simple("pause", a, "pause"),
+    "resume": lambda a: simple("resume", a, "resume"),
+    "flush": lambda a: simple("flush", a, "flush"),
+    "reset": cmd_reset,
+    "resolve": cmd_resolve,
+    "ignore": cmd_ignore,
+    "unignore": cmd_unignore,
+    "status": cmd_status,
+    "st": cmd_status,
+    "info": cmd_status,
+    "monitor": cmd_monitor,
+    "daemon": cmd_daemon,
+}
+
+
+def main(argv):
+    if not argv:
+        return cmd_list([])
+    if argv[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return 0
+    if argv[0] in ("-v", "--version", "version"):
+        print(f"toxic {VERSION}")
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd not in COMMANDS:
+        die(f"unknown command: {cmd}\nrun `toxic help`")
+    return COMMANDS[cmd](rest) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os._exit(0)
