@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+#
+# Install toxic into ~/.local/bin:
+#     curl -sL https://raw.githubusercontent.com/bobuk/toxic/main/toxic | python3
+#
 """toxic — a friendly front-end for mutagen sync sessions.
 
 Single file, stdlib only. Run `toxic help` for usage.
@@ -14,6 +18,13 @@ import sys
 import time
 
 VERSION = "0.1.0"
+
+REPO_RAW_URL = "https://raw.githubusercontent.com/bobuk/toxic/main/toxic"
+INSTALL_CANDIDATES = [
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/bin"),
+    os.path.expanduser("~/.bin"),
+]
 
 CONFIG_PATH = os.path.expanduser(
     os.environ.get("TOXIC_CONFIG", "~/.config/toxic/config.json")
@@ -1022,6 +1033,70 @@ def cmd_unignore(argv):
     return cmd_ignore(argv, remove=True)
 
 
+# -------------------------------------------------------------------- install
+
+def self_source():
+    """The toxic source: this file, or the canonical copy when piped in headless."""
+    main_file = getattr(sys.modules["__main__"], "__file__", None)
+    if main_file and os.path.exists(main_file):
+        with open(main_file, encoding="utf-8") as fh:
+            return fh.read()
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(REPO_RAW_URL) as resp:
+            return resp.read().decode("utf-8")
+    except Exception as exc:  # network, HTTP, TLS — all equally fatal here
+        die(f"could not fetch toxic from {REPO_RAW_URL}: {exc}")
+
+
+def choose_install_dir():
+    """Prefer a bin dir that's already on PATH so the install just works."""
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    for candidate in INSTALL_CANDIDATES:
+        if candidate in path_dirs:
+            return candidate, True
+    return INSTALL_CANDIDATES[0], False
+
+
+def install(argv=()):
+    target = None
+    argv = list(argv)
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-d", "--dir"):
+            i += 1
+            target = os.path.expanduser(argv[i])
+        elif argv[i].startswith("-"):
+            die(f"unknown option for install: {argv[i]}")
+        else:
+            target = os.path.expanduser(argv[i])
+        i += 1
+
+    source = self_source()
+    on_path = True
+    if target is None:
+        target, on_path = choose_install_dir()
+    else:
+        on_path = target in os.environ.get("PATH", "").split(os.pathsep)
+
+    path = os.path.join(target, "toxic")
+    try:
+        os.makedirs(target, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(source)
+        os.chmod(path, 0o755)
+    except OSError as exc:
+        die(f"unable to install into {target}: {exc}")
+
+    print(f"{green('✓')} installed toxic to {bold(path)}")
+    if not on_path:
+        print(f"{yellow('note')}: {target} is not in your PATH")
+        print("  fish:     " + dim(f"fish_add_path {target}"))
+        print("  bash/zsh: " + dim('export PATH="' + target + ':$PATH"'))
+    return 0
+
+
 HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the ceremony
 
 {bold('usage')}: toxic <command> [args]
@@ -1053,6 +1128,9 @@ HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the c
   {bold('status')} [name...]             detailed state, conflicts and problems (alias: st)
   {bold('monitor')} [name]               live status stream from mutagen
   {bold('daemon')} start|stop|restart|status
+  {bold('install')} [dir]                copy this script into {dim('~/.local/bin')} (or [dir]) and make it
+                              executable; piping the script into python3 does the same:
+                              {dim('curl -sL ' + REPO_RAW_URL + ' | python3')}
   {bold('help')} | {bold('version')}
 
 {bold('examples')}:
@@ -1088,10 +1166,17 @@ COMMANDS = {
     "info": cmd_status,
     "monitor": cmd_monitor,
     "daemon": cmd_daemon,
+    "install": install,
 }
 
 
 def main(argv):
+    # Piped into the interpreter (`curl ... | python3`) there is no backing
+    # file to run from, so the only sensible thing to do is self-install.
+    main_file = getattr(sys.modules["__main__"], "__file__", None)
+    if main_file is None or not os.path.exists(main_file):
+        return install()
+
     if not argv:
         return cmd_list([])
     if argv[0] in ("-h", "--help", "help"):
