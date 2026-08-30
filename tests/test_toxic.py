@@ -34,6 +34,45 @@ def session(name, root):
     }
 
 
+class GuiCommandTests(unittest.TestCase):
+    def test_gui_materializes_embedded_swift_app_and_forwards_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = toxic.subprocess.CompletedProcess(["swift"], 0)
+            with (
+                mock.patch.object(toxic.sys, "platform", "darwin"),
+                mock.patch.object(toxic.tempfile, "gettempdir", return_value=tmp),
+                mock.patch.object(toxic.subprocess, "run", return_value=completed) as run,
+            ):
+                result = toxic.cmd_gui(["."])
+
+            gui_path = Path(tmp) / "toxic-gui.swift"
+            self.assertEqual(gui_path.read_text(), toxic.TOXIC_GUI_SOURCE)
+            run.assert_called_once_with(["swift", str(gui_path), "."])
+
+        self.assertEqual(result, 0)
+
+    def test_gui_help_does_not_launch_swift(self):
+        output = io.StringIO()
+        with mock.patch.object(toxic.subprocess, "run") as run, contextlib.redirect_stdout(output):
+            result = toxic.cmd_gui(["--help"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("usage: toxic gui [path]", output.getvalue())
+        run.assert_not_called()
+
+    def test_gui_is_rejected_outside_macos(self):
+        errors = io.StringIO()
+        with (
+            mock.patch.object(toxic.sys, "platform", "linux"),
+            contextlib.redirect_stderr(errors),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            toxic.cmd_gui([])
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("available only on macOS", errors.getvalue())
+
+
 class PathStatusTests(unittest.TestCase):
     def test_path_status_uses_most_specific_covering_session(self):
         with tempfile.TemporaryDirectory() as tmp:

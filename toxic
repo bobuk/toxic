@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 VERSION = "0.1.0"
@@ -47,6 +48,445 @@ DEFAULTS = {
     # optional: {"orange": "oranges.team", ...} shorthand -> host
     "hosts": {},
 }
+
+
+# Embedded native macOS status app, materialized and run by `toxic gui`.
+TOXIC_GUI_SOURCE = r'''#!/usr/bin/env swift
+
+import AppKit
+import Foundation
+
+struct Endpoint {
+    let protocolName: String
+    let path: String
+    let host: String
+
+    init(_ json: [String: Any]) {
+        protocolName = json["protocol"] as? String ?? "unknown"
+        path = json["path"] as? String ?? "?"
+        host = json["host"] as? String ?? "?"
+    }
+
+    var display: String {
+        if protocolName == "local" {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+        }
+        return "\(host):\(path)"
+    }
+}
+
+struct SyncSession {
+    let identifier: String
+    let name: String
+    let status: String
+    let paused: Bool
+    let conflictCount: Int
+    let issueCount: Int
+    let successfulCycles: Int
+    let alpha: Endpoint
+    let beta: Endpoint
+
+    init?(_ json: [String: Any]) {
+        guard let identifier = json["identifier"] as? String else {
+            return nil
+        }
+        self.identifier = identifier
+        name = (json["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? String(identifier.prefix(12))
+        status = json["status"] as? String ?? "unknown"
+        paused = json["paused"] as? Bool ?? false
+        conflictCount = (json["conflicts"] as? [Any])?.count ?? 0
+        successfulCycles = Self.intValue(json["successfulCycles"])
+        let alphaJSON = json["alpha"] as? [String: Any] ?? [:]
+        let betaJSON = json["beta"] as? [String: Any] ?? [:]
+        alpha = Endpoint(alphaJSON)
+        beta = Endpoint(betaJSON)
+        issueCount = Self.problemCount(alphaJSON) + Self.problemCount(betaJSON)
+    }
+
+    var displayStatus: String {
+        if paused { return "paused" }
+        if conflictCount > 0 { return "conflicts (\(conflictCount))" }
+        return status
+    }
+
+    var needsAttention: Bool {
+        if paused || conflictCount > 0 || issueCount > 0 { return true }
+        return status != "watching"
+    }
+
+    var issues: String {
+        var parts: [String] = []
+        if conflictCount > 0 { parts.append("\(conflictCount) conflict\(conflictCount == 1 ? "" : "s")") }
+        if issueCount > 0 { parts.append("\(issueCount) issue\(issueCount == 1 ? "" : "s")") }
+        return parts.isEmpty ? "—" : parts.joined(separator: ", ")
+    }
+
+    var localRoots: [String] {
+        [alpha, beta].filter { $0.protocolName == "local" }.map(\.path)
+    }
+
+    private static func problemCount(_ endpoint: [String: Any]) -> Int {
+        let scans = (endpoint["scanProblems"] as? [Any])?.count ?? 0
+        let transitions = (endpoint["transitionProblems"] as? [Any])?.count ?? 0
+        return scans
+            + transitions
+            + intValue(endpoint["excludedScanProblems"])
+            + intValue(endpoint["excludedTransitionProblems"])
+    }
+
+    private static func intValue(_ value: Any?) -> Int {
+        if let number = value as? NSNumber { return number.intValue }
+        if let number = value as? Int { return number }
+        return 0
+    }
+}
+
+enum LoaderError: Error {
+    case message(String)
+}
+
+func normalizedPath(_ path: String) -> String {
+    let expanded = (path as NSString).expandingTildeInPath
+    let absolute: String
+    if expanded.hasPrefix("/") {
+        absolute = expanded
+    } else {
+        absolute = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(expanded).path
+    }
+    return URL(fileURLWithPath: absolute).standardizedFileURL.resolvingSymlinksInPath().path
+}
+
+func loadSessions(pathFilter: String?) throws -> [SyncSession] {
+    let process = Process()
+    let output = Pipe()
+    let errors = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["mutagen", "sync", "list", "--template", "{{json .}}"]
+    process.standardOutput = output
+    process.standardError = errors
+
+    do {
+        try process.run()
+    } catch {
+        throw LoaderError.message("mutagen not found in PATH")
+    }
+
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let message = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        throw LoaderError.message(message?.isEmpty == false ? message! : "unable to list Mutagen sessions")
+    }
+
+    let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !text.isEmpty, text != "null" else {
+        return []
+    }
+
+    let object = try JSONSerialization.jsonObject(with: data)
+    let records: [[String: Any]]
+    if let list = object as? [[String: Any]] {
+        records = list
+    } else if let record = object as? [String: Any] {
+        records = [record]
+    } else {
+        throw LoaderError.message("unexpected response from mutagen")
+    }
+
+    var sessions = records.compactMap(SyncSession.init)
+    if let pathFilter {
+        let target = normalizedPath(pathFilter)
+        let matches = sessions.compactMap { session -> (Int, SyncSession)? in
+            let rootLengths = session.localRoots.map(normalizedPath).compactMap { root in
+                target == root || target.hasPrefix(root + "/") ? root.count : nil
+            }
+            guard let bestRoot = rootLengths.max() else { return nil }
+            return (bestRoot, session)
+        }
+        if let best = matches.map(\.0).max() {
+            sessions = matches.filter { $0.0 == best }.map(\.1)
+        } else {
+            sessions = []
+        }
+    }
+    return sessions.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+}
+
+final class StatusWindow: NSWindow {
+    var onRefresh: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isCommandR = event.modifierFlags.contains(.command) && event.keyCode == 15
+        if isCommandR {
+            onRefresh?()
+            return
+        }
+        if event.keyCode == 53 {
+            NSApp.terminate(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private let pathFilter = Array(CommandLine.arguments.dropFirst()).first
+    private var sessions: [SyncSession] = []
+    private var window: NSWindow!
+    private var tableView: NSTableView!
+    private var scrollView: NSScrollView!
+    private var summaryLabel: NSTextField!
+    private var updateLabel: NSTextField!
+    private var emptyLabel: NSTextField!
+    private var refreshButton: NSButton!
+    private var timer: Timer?
+    private var isLoading = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildWindow()
+        reload()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.reload()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.terminate(nil)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        sessions.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard sessions.indices.contains(row), let tableColumn else { return nil }
+        let identifier = tableColumn.identifier
+        let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+            ?? NSTableCellView(frame: .zero)
+        let textField = cell.textField ?? NSTextField(labelWithString: "")
+        cell.identifier = identifier
+        cell.textField = textField
+
+        if textField.superview == nil {
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            textField.lineBreakMode = .byTruncatingMiddle
+            cell.addSubview(textField)
+            NSLayoutConstraint.activate([
+                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+                textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+
+        let session = sessions[row]
+        textField.font = .systemFont(ofSize: 12.5)
+        textField.textColor = .labelColor
+        textField.alignment = .left
+
+        switch identifier.rawValue {
+        case "Name":
+            textField.stringValue = session.name
+            textField.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        case "Status":
+            textField.stringValue = "●  " + session.displayStatus
+            textField.textColor = statusColor(for: session)
+        case "Local":
+            textField.stringValue = session.alpha.protocolName == "local" ? session.alpha.display : session.beta.display
+        case "Remote":
+            textField.stringValue = session.alpha.protocolName == "local" ? session.beta.display : session.alpha.display
+        case "Issues":
+            textField.stringValue = session.issues
+            textField.textColor = session.conflictCount > 0 || session.issueCount > 0
+                ? .systemRed
+                : .tertiaryLabelColor
+        case "Cycles":
+            textField.stringValue = "\(session.successfulCycles)"
+            textField.alignment = .right
+            textField.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
+        default:
+            textField.stringValue = ""
+        }
+        return cell
+    }
+
+    private func buildWindow() {
+        let frame = NSRect(x: 0, y: 0, width: 1040, height: 520)
+        let statusWindow = StatusWindow(
+            contentRect: frame,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window = statusWindow
+        window.title = pathFilter == nil ? "toxic — sync status" : "toxic — \(pathFilter!)"
+        window.delegate = self
+        statusWindow.onRefresh = { [weak self] in self?.reload() }
+        window.center()
+
+        let content = NSView(frame: frame)
+        content.autoresizingMask = [.width, .height]
+        window.contentView = content
+
+        let titleLabel = NSTextField(labelWithString: "☣ toxic")
+        titleLabel.frame = NSRect(x: 20, y: frame.height - 46, width: 120, height: 26)
+        titleLabel.autoresizingMask = [.maxXMargin, .minYMargin]
+        titleLabel.font = .systemFont(ofSize: 20, weight: .bold)
+        content.addSubview(titleLabel)
+
+        summaryLabel = NSTextField(labelWithString: "Loading Mutagen sessions…")
+        summaryLabel.frame = NSRect(x: 142, y: frame.height - 43, width: 520, height: 20)
+        summaryLabel.autoresizingMask = [.width, .minYMargin]
+        summaryLabel.font = .systemFont(ofSize: 12.5)
+        summaryLabel.textColor = .secondaryLabelColor
+        content.addSubview(summaryLabel)
+
+        updateLabel = NSTextField(labelWithString: "")
+        updateLabel.frame = NSRect(x: frame.width - 280, y: frame.height - 43, width: 174, height: 20)
+        updateLabel.autoresizingMask = [.minXMargin, .minYMargin]
+        updateLabel.alignment = .right
+        updateLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+        updateLabel.textColor = .tertiaryLabelColor
+        content.addSubview(updateLabel)
+
+        refreshButton = NSButton(title: "↻ Refresh", target: self, action: #selector(refresh))
+        refreshButton.frame = NSRect(x: frame.width - 98, y: frame.height - 48, width: 82, height: 28)
+        refreshButton.autoresizingMask = [.minXMargin, .minYMargin]
+        refreshButton.bezelStyle = .rounded
+        refreshButton.keyEquivalent = "r"
+        refreshButton.keyEquivalentModifierMask = .command
+        content.addSubview(refreshButton)
+
+        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: frame.width - 32, height: frame.height - 72))
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
+        content.addSubview(scrollView)
+
+        tableView = NSTableView(frame: scrollView.bounds)
+        tableView.autoresizingMask = [.width, .height]
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.rowHeight = 30
+        tableView.backgroundColor = .textBackgroundColor
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        addColumn("Name", width: 140)
+        addColumn("Status", width: 150)
+        addColumn("Local", width: 230)
+        addColumn("Remote", width: 250)
+        addColumn("Cycles", width: 70)
+        addColumn("Issues", width: 150)
+        scrollView.documentView = tableView
+
+        emptyLabel = NSTextField(labelWithString: "No sync sessions")
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyLabel.alignment = .center
+        emptyLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.isHidden = true
+        content.addSubview(emptyLabel)
+        NSLayoutConstraint.activate([
+            emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+        ])
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func addColumn(_ title: String, width: CGFloat) {
+        let identifier = NSUserInterfaceItemIdentifier(title)
+        let column = NSTableColumn(identifier: identifier)
+        column.title = title
+        column.width = width
+        column.minWidth = title == "Cycles" ? width : 80
+        tableView.addTableColumn(column)
+    }
+
+    private func statusColor(for session: SyncSession) -> NSColor {
+        if session.conflictCount > 0 || session.issueCount > 0 { return .systemRed }
+        if session.paused { return .systemOrange }
+        if session.status == "watching" { return .systemGreen }
+        if session.status.hasPrefix("connecting") || session.status.hasPrefix("disconnected") { return .systemRed }
+        return .systemBlue
+    }
+
+    @objc private func refresh() {
+        reload()
+    }
+
+    private func reload() {
+        guard !isLoading else { return }
+        isLoading = true
+        refreshButton?.isEnabled = false
+        let filter = pathFilter
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result: Result<[SyncSession], Error>
+            do {
+                result = .success(try loadSessions(pathFilter: filter))
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                self?.apply(result)
+            }
+        }
+    }
+
+    private func apply(_ result: Result<[SyncSession], Error>) {
+        isLoading = false
+        refreshButton.isEnabled = true
+        switch result {
+        case .success(let loaded):
+            sessions = loaded
+            tableView.reloadData()
+            let attention = loaded.filter(\.needsAttention).count
+            let healthy = loaded.count - attention
+            if loaded.isEmpty {
+                summaryLabel.stringValue = pathFilter == nil
+                    ? "No Mutagen sync sessions found"
+                    : "No sync session covers \(pathFilter!)"
+            } else {
+                summaryLabel.stringValue = "\(loaded.count) session\(loaded.count == 1 ? "" : "s")  •  \(healthy) healthy  •  \(attention) need attention"
+            }
+            summaryLabel.textColor = attention > 0 ? .systemOrange : .secondaryLabelColor
+            emptyLabel.stringValue = pathFilter == nil ? "No sync sessions" : "Path is not synchronized"
+            emptyLabel.isHidden = !loaded.isEmpty
+            scrollView.isHidden = loaded.isEmpty
+        case .failure(let error):
+            sessions = []
+            tableView.reloadData()
+            summaryLabel.stringValue = message(for: error)
+            summaryLabel.textColor = .systemRed
+            emptyLabel.stringValue = "Unable to load status"
+            emptyLabel.isHidden = false
+            scrollView.isHidden = true
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        updateLabel.stringValue = "updated " + formatter.string(from: Date())
+    }
+
+    private func message(for error: Error) -> String {
+        if case LoaderError.message(let message) = error { return message }
+        return error.localizedDescription
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppController()
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()
+'''
 
 
 # ---------------------------------------------------------------- pretty bits
@@ -1062,6 +1502,29 @@ def cmd_unignore(argv):
     return cmd_ignore(argv, remove=True)
 
 
+# ------------------------------------------------------------------------ gui
+
+def cmd_gui(argv):
+    if any(arg in ("-h", "--help", "help") for arg in argv):
+        print("usage: toxic gui [path]\n\nOpen the native macOS sync status window, optionally filtered by path.")
+        return 0
+    if len(argv) > 1:
+        die("usage: toxic gui [path]")
+    if sys.platform != "darwin":
+        die("toxic gui is available only on macOS")
+
+    gui_path = os.path.join(tempfile.gettempdir(), "toxic-gui.swift")
+    try:
+        with open(gui_path, "w", encoding="utf-8") as fh:
+            fh.write(TOXIC_GUI_SOURCE)
+        os.chmod(gui_path, 0o755)
+        return subprocess.run(["swift", gui_path] + list(argv)).returncode
+    except FileNotFoundError:
+        die("the GUI needs Swift — install the Xcode Command Line Tools: xcode-select --install")
+    except OSError as exc:
+        die(f"unable to launch GUI: {exc}")
+
+
 # -------------------------------------------------------------------- install
 
 def self_source():
@@ -1157,6 +1620,7 @@ HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the c
   {bold('reset')} <name>...              pause + resume to force a full re-scan
   {bold('status')} [name...]             detailed state, conflicts and problems (alias: st)
   {bold('monitor')} [name]               live status stream from mutagen
+  {bold('gui')} [path]                   open the native macOS status window (alias: g)
   {bold('daemon')} start|stop|restart|status
   {bold('install')} [dir]                copy this script into {dim('~/.local/bin')} (or [dir]) and make it
                               executable; piping the script into python3 does the same:
@@ -1165,6 +1629,7 @@ HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the c
 
 {bold('examples')}:
   toxic .                               {dim('→ status of the session syncing the current directory')}
+  toxic gui .                           {dim('→ the same status in a live macOS window')}
   toxic add . oranges.team:/tmp          {dim('→ ~/GitHub/bobuk/toxic ⇄ oranges.team:/tmp/toxic, named toxic-oranges')}
   toxic add . bobuk.io:/srv -n web       {dim('→ named web')}
   toxic add oranges.team:/stacks/olly .  {dim('→ reversed order works too')}
@@ -1196,6 +1661,8 @@ COMMANDS = {
     "st": cmd_status,
     "info": cmd_status,
     "monitor": cmd_monitor,
+    "gui": cmd_gui,
+    "g": cmd_gui,
     "daemon": cmd_daemon,
     "install": install,
 }
