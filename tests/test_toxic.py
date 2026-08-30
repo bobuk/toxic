@@ -72,6 +72,17 @@ class GuiCommandTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         self.assertIn("available only on macOS", errors.getvalue())
 
+    def test_embedded_gui_registers_standard_quit_shortcut(self):
+        self.assertIn('keyEquivalent: "q"', toxic.TOXIC_GUI_SOURCE)
+        self.assertIn("quitItem.keyEquivalentModifierMask = .command", toxic.TOXIC_GUI_SOURCE)
+        self.assertIn("quitItem.target = NSApp", toxic.TOXIC_GUI_SOURCE)
+
+    def test_embedded_gui_uses_compact_binary_status_indicator(self):
+        self.assertIn('textField.stringValue = "●"', toxic.TOXIC_GUI_SOURCE)
+        self.assertIn("session.needsAttention ? .systemRed : .systemGreen", toxic.TOXIC_GUI_SOURCE)
+        self.assertNotIn('"●  " + session.displayStatus', toxic.TOXIC_GUI_SOURCE)
+        self.assertIn("tableView.rowHeight = 24", toxic.TOXIC_GUI_SOURCE)
+
 
 class PathStatusTests(unittest.TestCase):
     def test_path_status_uses_most_specific_covering_session(self):

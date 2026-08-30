@@ -29,10 +29,11 @@ toxic gui .                      # same, filtered to the current directory
 
 ## 🖥️ GUI
 
-`toxic gui` opens a native macOS status window with every Mutagen session, its local and remote
-paths, current state, conflicts, problems, and successful cycle count. The view refreshes every
-second; use `⌘R` to refresh immediately or `Esc` to close it. Pass a path to focus on the session
-that covers it: `toxic gui path/to/project`.
+`toxic gui` opens a compact native macOS status window with every Mutagen session, its local and
+remote paths, health, conflicts, problems, and successful cycle count. A green lamp means the
+session is healthy; a red lamp means it needs attention (hover to see its state). The view refreshes
+every second; use `⌘R` to refresh immediately and `⌘Q` or `Esc` to quit. Pass a path to focus on the
+session that covers it: `toxic gui path/to/project`.
 
 Like `bl gui`, the AppKit app is embedded in the single `toxic` script, written to a temporary
 Swift file on launch, and requires the Xcode Command Line Tools (`xcode-select --install`).

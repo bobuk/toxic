@@ -246,6 +246,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var isLoading = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installMainMenu()
         buildWindow()
         reload()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -279,24 +280,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             textField.lineBreakMode = .byTruncatingMiddle
             cell.addSubview(textField)
             NSLayoutConstraint.activate([
-                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
                 textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
             ])
         }
 
         let session = sessions[row]
-        textField.font = .systemFont(ofSize: 12.5)
+        textField.font = .systemFont(ofSize: 11.5)
         textField.textColor = .labelColor
         textField.alignment = .left
+        textField.toolTip = nil
+        textField.setAccessibilityLabel(nil)
 
         switch identifier.rawValue {
         case "Name":
             textField.stringValue = session.name
-            textField.font = .systemFont(ofSize: 12.5, weight: .semibold)
+            textField.font = .systemFont(ofSize: 11.5, weight: .semibold)
         case "Status":
-            textField.stringValue = "●  " + session.displayStatus
-            textField.textColor = statusColor(for: session)
+            textField.stringValue = "●"
+            textField.font = .systemFont(ofSize: 8, weight: .medium)
+            textField.alignment = .center
+            textField.textColor = session.needsAttention ? .systemRed : .systemGreen
+            textField.toolTip = session.displayStatus
+            textField.setAccessibilityLabel("Status: \(session.displayStatus)")
         case "Local":
             textField.stringValue = session.alpha.protocolName == "local" ? session.alpha.display : session.beta.display
         case "Remote":
@@ -309,15 +316,32 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         case "Cycles":
             textField.stringValue = "\(session.successfulCycles)"
             textField.alignment = .right
-            textField.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
+            textField.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
         default:
             textField.stringValue = ""
         }
         return cell
     }
 
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+        let applicationMenuItem = NSMenuItem()
+        let applicationMenu = NSMenu()
+        let quitItem = NSMenuItem(
+            title: "Quit toxic",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = .command
+        quitItem.target = NSApp
+        applicationMenu.addItem(quitItem)
+        applicationMenuItem.submenu = applicationMenu
+        mainMenu.addItem(applicationMenuItem)
+        NSApp.mainMenu = mainMenu
+    }
+
     private func buildWindow() {
-        let frame = NSRect(x: 0, y: 0, width: 1040, height: 520)
+        let frame = NSRect(x: 0, y: 0, width: 880, height: 400)
         let statusWindow = StatusWindow(
             contentRect: frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -335,35 +359,36 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         window.contentView = content
 
         let titleLabel = NSTextField(labelWithString: "☣ toxic")
-        titleLabel.frame = NSRect(x: 20, y: frame.height - 46, width: 120, height: 26)
+        titleLabel.frame = NSRect(x: 14, y: frame.height - 38, width: 98, height: 22)
         titleLabel.autoresizingMask = [.maxXMargin, .minYMargin]
-        titleLabel.font = .systemFont(ofSize: 20, weight: .bold)
+        titleLabel.font = .systemFont(ofSize: 17, weight: .bold)
         content.addSubview(titleLabel)
 
         summaryLabel = NSTextField(labelWithString: "Loading Mutagen sessions…")
-        summaryLabel.frame = NSRect(x: 142, y: frame.height - 43, width: 520, height: 20)
+        summaryLabel.frame = NSRect(x: 110, y: frame.height - 35, width: 470, height: 18)
         summaryLabel.autoresizingMask = [.width, .minYMargin]
-        summaryLabel.font = .systemFont(ofSize: 12.5)
+        summaryLabel.font = .systemFont(ofSize: 11.5)
         summaryLabel.textColor = .secondaryLabelColor
         content.addSubview(summaryLabel)
 
         updateLabel = NSTextField(labelWithString: "")
-        updateLabel.frame = NSRect(x: frame.width - 280, y: frame.height - 43, width: 174, height: 20)
+        updateLabel.frame = NSRect(x: frame.width - 226, y: frame.height - 35, width: 170, height: 18)
         updateLabel.autoresizingMask = [.minXMargin, .minYMargin]
         updateLabel.alignment = .right
-        updateLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+        updateLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         updateLabel.textColor = .tertiaryLabelColor
         content.addSubview(updateLabel)
 
-        refreshButton = NSButton(title: "↻ Refresh", target: self, action: #selector(refresh))
-        refreshButton.frame = NSRect(x: frame.width - 98, y: frame.height - 48, width: 82, height: 28)
+        refreshButton = NSButton(title: "↻", target: self, action: #selector(refresh))
+        refreshButton.frame = NSRect(x: frame.width - 46, y: frame.height - 40, width: 32, height: 24)
         refreshButton.autoresizingMask = [.minXMargin, .minYMargin]
         refreshButton.bezelStyle = .rounded
+        refreshButton.toolTip = "Refresh (⌘R)"
         refreshButton.keyEquivalent = "r"
         refreshButton.keyEquivalentModifierMask = .command
         content.addSubview(refreshButton)
 
-        scrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: frame.width - 32, height: frame.height - 72))
+        scrollView = NSScrollView(frame: NSRect(x: 12, y: 12, width: frame.width - 24, height: frame.height - 58))
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = true
@@ -374,22 +399,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         tableView.autoresizingMask = [.width, .height]
         tableView.delegate = self
         tableView.dataSource = self
-        tableView.rowHeight = 30
+        tableView.rowHeight = 24
         tableView.backgroundColor = .textBackgroundColor
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-        addColumn("Name", width: 140)
-        addColumn("Status", width: 150)
-        addColumn("Local", width: 230)
-        addColumn("Remote", width: 250)
-        addColumn("Cycles", width: 70)
-        addColumn("Issues", width: 150)
+        addColumn("Name", width: 120)
+        addColumn("Status", width: 54)
+        addColumn("Local", width: 190)
+        addColumn("Remote", width: 220)
+        addColumn("Cycles", width: 60)
+        addColumn("Issues", width: 120)
         scrollView.documentView = tableView
 
         emptyLabel = NSTextField(labelWithString: "No sync sessions")
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         emptyLabel.alignment = .center
-        emptyLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        emptyLabel.font = .systemFont(ofSize: 17, weight: .semibold)
         emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.isHidden = true
         content.addSubview(emptyLabel)
@@ -409,14 +434,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         column.width = width
         column.minWidth = title == "Cycles" ? width : 80
         tableView.addTableColumn(column)
-    }
-
-    private func statusColor(for session: SyncSession) -> NSColor {
-        if session.conflictCount > 0 || session.issueCount > 0 { return .systemRed }
-        if session.paused { return .systemOrange }
-        if session.status == "watching" { return .systemGreen }
-        if session.status.hasPrefix("connecting") || session.status.hasPrefix("disconnected") { return .systemRed }
-        return .systemBlue
     }
 
     @objc private func refresh() {
