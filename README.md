@@ -15,6 +15,8 @@ and, for the interactive bits, `fzf`.
 
 ```sh
 toxic                            # list every session and its state
+toxic .                          # show sync status for the current directory
+toxic path/to/project            # show sync status for a specific path
 toxic add . oranges.team:/tmp    # sync this folder to /tmp/<folder> over there
 toxic ignore build/              # stop syncing a path
 toxic resolve                    # walk through conflicts, pick a winner

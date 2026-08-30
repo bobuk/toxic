@@ -510,12 +510,7 @@ def cmd_rm(argv):
     return rc
 
 
-def cmd_status(argv):
-    names = [a for a in argv if not a.startswith("-")]
-    ss = sessions(names)
-    if not ss:
-        info("no matching sessions")
-        return 1
+def print_status(ss):
     for s in ss:
         print(f"{bold(s.get('name') or s['identifier'])}  {status_badge(s)}")
         print(f"  {dim('id     ')} {s['identifier']}")
@@ -537,6 +532,15 @@ def cmd_status(argv):
                 for p in s.get(side, {}).get(kind, []):
                     print(f"  {yellow(side + ' ' + kind[:4])} {p.get('path')}: {p.get('error')}")
         print()
+
+
+def cmd_status(argv):
+    names = [a for a in argv if not a.startswith("-")]
+    ss = sessions(names)
+    if not ss:
+        info("no matching sessions")
+        return 1
+    print_status(ss)
     return 0
 
 
@@ -925,7 +929,7 @@ def recreate(s, ignores, yes=False, dry=False):
 def session_for_path(path):
     """Sessions whose local root contains `path` (most specific root wins)."""
     matches = []
-    target = os.path.realpath(path)
+    target = os.path.realpath(os.path.expanduser(path))
     for s in sessions():
         alpha = s.get("alpha", {})
         if alpha.get("protocol") != "local":
@@ -937,6 +941,31 @@ def session_for_path(path):
         return []
     best = max(m[0] for m in matches)
     return [s for length, s in matches if length == best]
+
+
+def cmd_path_status(path):
+    ss = session_for_path(path)
+    if not ss:
+        display = fmt_endpoint(
+            {"protocol": "local", "path": os.path.abspath(os.path.expanduser(path))}
+        )
+        info(f"no sync session covers {display}")
+        return 1
+    print_status(ss)
+    return 0
+
+
+def looks_like_path(arg):
+    """Whether a positional argument is intended as a local path, not a command."""
+    expanded = os.path.expanduser(arg)
+    separators = [sep for sep in (os.sep, os.altsep) if sep]
+    return (
+        arg in (".", "..")
+        or arg.startswith("~")
+        or os.path.isabs(expanded)
+        or any(sep in arg for sep in separators)
+        or os.path.lexists(expanded)
+    )
 
 
 def ignore_pattern(arg, root):
@@ -1099,8 +1128,9 @@ def install(argv=()):
 
 HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the ceremony
 
-{bold('usage')}: toxic <command> [args]
+{bold('usage')}: toxic [path | command] [args]
 
+  {bold('PATH')}                             show sync status for a local path ({dim('toxic .')})
   {bold('list')} [-l] [--json] [name...]   list sessions and their state (alias: ls, l, or no command)
   {bold('add')} <local> <host:/path>       create a sync session
       -n, --name NAME     override the generated name ({dim('<folder>-<host>')})
@@ -1134,6 +1164,7 @@ HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the c
   {bold('help')} | {bold('version')}
 
 {bold('examples')}:
+  toxic .                               {dim('→ status of the session syncing the current directory')}
   toxic add . oranges.team:/tmp          {dim('→ ~/GitHub/bobuk/toxic ⇄ oranges.team:/tmp/toxic, named toxic-oranges')}
   toxic add . bobuk.io:/srv -n web       {dim('→ named web')}
   toxic add oranges.team:/stacks/olly .  {dim('→ reversed order works too')}
@@ -1186,9 +1217,13 @@ def main(argv):
         print(f"toxic {VERSION}")
         return 0
     cmd, rest = argv[0], argv[1:]
-    if cmd not in COMMANDS:
-        die(f"unknown command: {cmd}\nrun `toxic help`")
-    return COMMANDS[cmd](rest) or 0
+    if cmd in COMMANDS:
+        return COMMANDS[cmd](rest) or 0
+    if looks_like_path(cmd):
+        if rest:
+            die("usage: toxic <path>")
+        return cmd_path_status(cmd)
+    die(f"unknown command: {cmd}\nrun `toxic help`")
 
 
 if __name__ == "__main__":
