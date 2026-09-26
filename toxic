@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 REPO_RAW_URL = "https://raw.githubusercontent.com/bobuk/toxic/main/toxic"
 INSTALL_CANDIDATES = [
@@ -1237,6 +1237,241 @@ def cmd_resolve(argv):
     return 0
 
 
+# ------------------------------------------------------------------ doctor
+
+HALTED_REASONS = {
+    "halted-on-root-emptied": "a sync root was emptied — mutagen stopped to keep it from wiping the other side",
+    "halted-on-root-deletion": "a sync root was deleted — mutagen stopped instead of deleting the other side",
+    "halted-on-root-type-change": "a sync root changed type (file ⇄ directory) — mutagen stopped",
+}
+
+ISSUE_HINTS = {
+    "conflict": "would ask which side to keep, delete the other, and flush",
+    "problem": "offered: ignore the path, or reset the session (full re-scan)",
+    "excluded": "offered: reset the session (full re-scan) after fixing the cause",
+    "halted": "offered: recreate the session under the same name (terminate + create)",
+    "offline": "offered: resume / flush, or reset the session",
+}
+
+
+def doctor_issues(s):
+    """Every actionable problem of one session, as (kind, payload) pairs."""
+    issues = []
+    for conflict in s.get("conflicts", []):
+        issues.append(("conflict", conflict))
+    for side in ("alpha", "beta"):
+        ep = s.get(side, {})
+        for kind, tag in (("scanProblems", "scan"), ("transitionProblems", "transfer")):
+            for p in ep.get(kind, []):
+                issues.append(("problem", (side, tag, p)))
+        excluded = ep.get("excludedScanProblems", 0) + ep.get("excludedTransitionProblems", 0)
+        if excluded:
+            issues.append(("excluded", (side, excluded)))
+    if s.get("paused"):
+        return issues
+    status = s.get("status", "")
+    if status in HALTED_REASONS:
+        issues.append(("halted", status))
+    elif status.startswith("connecting") or status.startswith("disconnected"):
+        issues.append(("offline", status))
+    else:
+        for side in ("alpha", "beta"):
+            if not s.get(side, {}).get("connected", True):
+                issues.append(("offline", f"{side} not connected"))
+    return issues
+
+
+def describe_issue(s, kind, payload):
+    if kind == "conflict":
+        a_what, _ = change_kind(payload.get("alphaChanges"))
+        b_what, _ = change_kind(payload.get("betaChanges"))
+        return f"{payload.get('root', '?')}  ({a_what} locally vs {b_what} remotely)"
+    if kind == "problem":
+        side, tag, p = payload
+        return f"{tag} problem on {side}: {p.get('path')}: {p.get('error')}"
+    if kind == "excluded":
+        side, n = payload
+        return f"{n} path{'s' if n != 1 else ''} on {side} fell out of sync (permissions or staging) and were excluded"
+    if kind == "halted":
+        return HALTED_REASONS[payload]
+    return f"endpoint unreachable: {payload}"
+
+
+def reset_session(s):
+    """Pause + resume to force a full re-scan (same as `toxic reset`)."""
+    name = s.get("name") or s["identifier"]
+    quiet(["sync", "pause", name], f"{dim('reset')} {bold(name)}")
+    run(["sync", "resume", name], capture=True, check=False)
+
+
+def ignore_problem_path(s, rel):
+    """Add an anchored ignore pattern for a problematic path and recreate the session."""
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        die(f"refusing to ignore suspicious path: {rel!r}")
+    pattern = "/" + rel.strip("/")
+    current = list((s.get("ignore") or {}).get("paths", []))
+    if pattern in current:
+        info(f"{pattern} is already ignored")
+        return False
+    return recreate(s, current + [pattern], yes=True) == 0
+
+
+def doctor_conflict(s, conflict, index, total):
+    show_conflict(s, conflict, index, total)
+    choice = ask(
+        f"  keep {green('[l]ocal')} / {cyan('[r]emote')} / {dim('[s]kip')} / {dim('[q]uit')}? ",
+        ("l", "r", "s", "q"),
+    )
+    if choice not in ("l", "r"):
+        return "skipped" if choice == "s" else "quit"
+    entry = (conflict.get("alphaChanges") or conflict.get("betaChanges") or [{}])[0]
+    if (entry.get("new") or entry.get("old") or {}).get("kind") == "directory":
+        if ask(f"  {red('that is a directory')} — delete it? [y/N] ", ("y", "n", "")) != "y":
+            return "skipped"
+    resolve_conflict(s, conflict, choice)
+    return "fixed"
+
+
+def doctor_problem(s, side, tag, p):
+    rel = p.get("path", "")
+    print(f"  {yellow(tag + ' problem')} {dim(side)} {rel}: {p.get('error')}  {probe(s.get(side, {}), rel)}")
+    choice = ask(
+        f"  {dim('[i]gnore path')} / {dim('[r]eset session')} / {dim('[s]kip')} / {dim('[q]uit')}? ",
+        ("i", "r", "s", "q"),
+    )
+    if choice == "i":
+        print(f"  {green('+')} ignoring /{rel.strip('/')} in {bold(s.get('name') or s['identifier'])}")
+        return "recreated" if ignore_problem_path(s, rel) else "skipped"
+    if choice == "r":
+        reset_session(s)
+        return "recreated"
+    return "skipped" if choice == "s" else "quit"
+
+
+def doctor_excluded(s, side, n):
+    print(f"  {yellow('excluded')} {n} path{'s' if n != 1 else ''} on {side} — not being synced")
+    choice = ask(f"  {dim('[r]eset session')} / {dim('[s]kip')} / {dim('[q]uit')}? ", ("r", "s", "q"))
+    if choice == "r":
+        reset_session(s)
+        return "recreated"
+    return "skipped" if choice == "s" else "quit"
+
+
+def doctor_halted(s, status):
+    print(f"  {red('halted')} {HALTED_REASONS[status]}")
+    missing = [
+        ep["path"]
+        for side in ("alpha", "beta")
+        for ep in [s.get(side, {})]
+        if ep.get("protocol") == "local" and not os.path.lexists(ep["path"])
+    ]
+    if missing:
+        print(f"  {dim('restore the root first:')} {', '.join(missing)}")
+        choice = ask(f"  {dim('[s]kip')} / {dim('[q]uit')}? ", ("s", "q"))
+        return "skipped" if choice == "s" else "quit"
+    print(dim("  the session is terminated and recreated — history resets, no files are touched"))
+    choice = ask(f"  {dim('[r]ecreate session')} / {dim('[s]kip')} / {dim('[q]uit')}? ", ("r", "s", "q"))
+    if choice == "r":
+        current = list((s.get("ignore") or {}).get("paths", []))
+        return "recreated" if recreate(s, current, yes=True) == 0 else "skipped"
+    return "skipped" if choice == "s" else "quit"
+
+
+def doctor_offline(s, what):
+    print(f"  {red('offline')} {what}")
+    choice = ask(
+        f"  {dim('[r]esume')} / {dim('[f]lush')} / {dim('[s]kip')} / {dim('[q]uit')}? ",
+        ("r", "f", "s", "q"),
+    )
+    name = s.get("name") or s["identifier"]
+    if choice == "r":
+        quiet(["sync", "resume", name], f"{dim('resume')} {bold(name)}")
+        return "fixed"
+    if choice == "f":
+        quiet(["sync", "flush", name], f"{dim('flush')} {bold(name)}")
+        return "fixed"
+    return "skipped" if choice == "s" else "quit"
+
+
+def cmd_doctor(argv):
+    dry = any(a in ("-N", "--dry-run") for a in argv)
+    names = [a for a in argv if not a.startswith("-")]
+    ss = sessions(names)
+    if not ss:
+        info("no sync sessions")
+        return 0
+    flagged = [(s, doctor_issues(s)) for s in ss]
+    flagged = [(s, issues) for s, issues in flagged if issues]
+    if not flagged:
+        plural = "s" if len(ss) != 1 else ""
+        print(f"{green('✓')} {len(ss)} session{plural}, all healthy")
+        return 0
+
+    total = sum(len(issues) for _, issues in flagged)
+    plural = "s" if total != 1 else ""
+    print(f"{yellow('!')} {total} issue{plural} in {len(flagged)} of {len(ss)} sessions")
+    if dry or not sys.stdin.isatty():
+        for s, issues in flagged:
+            print()
+            print(f"{bold(s.get('name') or s['identifier'])}  {status_badge(s)}")
+            for kind, payload in issues:
+                print(f"  {yellow(kind)}  {describe_issue(s, kind, payload)}")
+                print(f"      {dim('→ ' + ISSUE_HINTS[kind])}")
+        if not dry:
+            info("run `toxic doctor` in a terminal to fix these interactively")
+        return 1
+
+    fixed = skipped = 0
+    touched = set()
+    quit_ = False
+    for s, issues in flagged:
+        if quit_:
+            skipped += len(issues)
+            continue
+        name = s.get("name") or s["identifier"]
+        print()
+        print(f"{bold(name)}" + (f"  {yellow('(paused)')}" if s.get("paused") else ""))
+        print(f"  {dim(fmt_endpoint(s.get('alpha', {})) + '  ⇄  ' + fmt_endpoint(s.get('beta', {})))}")
+        for i, (kind, payload) in enumerate(issues, 1):
+            if kind == "conflict":
+                result = doctor_conflict(s, payload, i, len(issues))
+                if result == "fixed":
+                    touched.add(name)
+            elif kind == "problem":
+                side, tag, p = payload
+                result = doctor_problem(s, side, tag, p)
+            elif kind == "excluded":
+                result = doctor_excluded(s, *payload)
+            elif kind == "halted":
+                result = doctor_halted(s, payload)
+            else:
+                result = doctor_offline(s, payload)
+            if result == "fixed":
+                fixed += 1
+            elif result == "recreated":
+                fixed += 1
+                info(f"{bold(name)} was recreated — its remaining issues belong to the old session")
+                break
+            elif result == "quit":
+                quit_ = True
+                skipped += len(issues) - i
+                break
+            else:
+                skipped += 1
+
+    if touched:
+        for name in sorted(touched):
+            quiet(["sync", "flush", name], f"{dim('flush')} {bold(name)}")
+    print()
+    parts = []
+    if fixed:
+        parts.append(green(f"{fixed} fixed"))
+    if skipped:
+        parts.append(f"{skipped} left alone")
+    print(f"{bold('doctor')}: " + (", ".join(parts) if parts else "nothing to do"))
+    return 1 if skipped else 0
+
+
 # -------------------------------------------------------------------- ignores
 
 def json_endpoint_url(ep):
@@ -1634,6 +1869,8 @@ HELP = f"""{bold('toxic')} {dim(VERSION)} — mutagen sync sessions, minus the c
   {bold('resolve')} [name...]            walk through conflicts and pick a winner per file
       --local / --remote  resolve everything that way, no questions asked
       -N, --dry-run       print what would be removed instead of removing it
+  {bold('doctor')} [name...]             find session problems and offer to fix them one by one
+      -N, --dry-run       list issues and the fixes on offer, ask nothing
   {bold('reset')} <name>...              pause + resume to force a full re-scan
   {bold('status')} [name...]             detailed state, conflicts and problems (alias: st)
   {bold('monitor')} [name]               live status stream from mutagen
@@ -1672,6 +1909,7 @@ COMMANDS = {
     "flush": lambda a: simple("flush", a, "flush"),
     "reset": cmd_reset,
     "resolve": cmd_resolve,
+    "doctor": cmd_doctor,
     "ignore": cmd_ignore,
     "unignore": cmd_unignore,
     "status": cmd_status,

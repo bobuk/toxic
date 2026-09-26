@@ -133,5 +133,53 @@ class PathStatusTests(unittest.TestCase):
         path_status.assert_called_once_with("project")
 
 
+class DoctorTests(unittest.TestCase):
+    def test_doctor_issues_collects_conflicts_problems_and_halts(self):
+        s = session("web", "/tmp/web")
+        s["conflicts"] = [{"root": "src/a.py"}]
+        s["alpha"]["scanProblems"] = [{"path": "b", "error": "permission denied"}]
+        s["beta"]["excludedScanProblems"] = 2
+        s["status"] = "halted-on-root-emptied"
+        kinds = [k for k, _ in toxic.doctor_issues(s)]
+        self.assertEqual(kinds, ["conflict", "problem", "excluded", "halted"])
+
+    def test_paused_sessions_skip_connectivity_issues(self):
+        s = session("web", "/tmp/web")
+        s["paused"] = True
+        s["status"] = "disconnected"
+        s["alpha"]["connected"] = False
+        self.assertEqual(toxic.doctor_issues(s), [])
+
+    def test_unconnected_endpoint_is_an_issue(self):
+        s = session("web", "/tmp/web")
+        s["beta"]["connected"] = False
+        self.assertEqual(toxic.doctor_issues(s), [("offline", "beta not connected")])
+
+    def test_doctor_reports_all_healthy(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(toxic, "sessions", return_value=[session("a", "/tmp/a")]),
+            contextlib.redirect_stdout(output),
+        ):
+            result = toxic.cmd_doctor([])
+        self.assertEqual(result, 0)
+        self.assertIn("all healthy", output.getvalue())
+
+    def test_doctor_lists_issues_without_a_tty(self):
+        s = session("web", "/tmp/web")
+        s["conflicts"] = [{"root": "x", "alphaChanges": [{"new": {"kind": "file"}}], "betaChanges": []}]
+        output = io.StringIO()
+        with (
+            mock.patch.object(toxic, "sessions", return_value=[s]),
+            contextlib.redirect_stdout(output),
+        ):
+            result = toxic.cmd_doctor(["--dry-run"])
+        self.assertEqual(result, 1)
+        out = output.getvalue()
+        self.assertIn("1 issue in 1 of 1 sessions", out)
+        self.assertIn("conflict", out)
+        self.assertIn("x", out)
+
+
 if __name__ == "__main__":
     unittest.main()

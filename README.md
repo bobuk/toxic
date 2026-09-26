@@ -20,6 +20,7 @@ toxic path/to/project            # show sync status for a specific path
 toxic add . oranges.team:/tmp    # sync this folder to /tmp/<folder> over there
 toxic ignore build/              # stop syncing a path
 toxic resolve                    # walk through conflicts, pick a winner
+toxic doctor                     # find problems in every session, fix them one by one
 toxic rm                         # pick sessions to terminate
 toxic pause / resume / flush     # the usual, with -a for all sessions
 toxic status                     # conflicts, problems, sizes, ignores
@@ -56,6 +57,15 @@ both sides — what changed, how big, how old — and asks:
 Mutagen has no resolve verb, so the losing copy is deleted (locally or over `ssh`) and the
 session flushed, which lets the surviving side propagate. `--local` / `--remote` resolve
 everything one way; `-N` shows what would be removed and removes nothing.
+
+## 🩺 Doctor
+
+`toxic doctor` checks every sync session — conflicts, scan/transfer problems,
+excluded paths, halted and offline endpoints — and walks you through the fixes
+one by one: pick a side for a conflict, ignore a path or reset the session
+(full re-scan) for a problem, recreate a halted session once its root is back.
+Healthy sessions are skipped silently. Pass `-N` (or run it from a script,
+where there's no terminal) to just list what's wrong and what would be offered.
 
 ## 🙈 Ignores
 
